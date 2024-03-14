@@ -13,6 +13,7 @@ from pygments import highlight
 from pygments.lexers import get_lexer_by_name
 from pygments.formatters.terminal import TerminalFormatter
 import tiktoken
+import json
 
 
 def num_tokens_from_string(string: str, model_name: str = "gpt-4-turbo-preview") -> int:
@@ -36,6 +37,8 @@ class SimpleChatbot:
         self.persist = persist
         self.total_tokens = 0
         self.working_directory = working_directory
+        self.lenses: Dict[str, Dict[str, int]] = {}  # New line: Dictionary of lenses
+        self.active_lens: str = ""  # New line: Name of the currently active lens
 
         # Immediately set the working directory
         os.chdir(self.working_directory)
@@ -62,18 +65,29 @@ class SimpleChatbot:
             print(f"File {filepath} does not exist.")
 
     def save_tracked_files(self):
-        with open(".localchat-tracking", "w") as file:
-            for filepath, token_count in self.tracked_files.items():
-                file.write(f"{filepath},{token_count}\n")
+        data = {
+            "tracked_files": self.tracked_files,
+            "lenses": self.lenses,
+            "active_lens": self.active_lens,  # Save the active lens
+        }
+        with open(".localchat-tracking.json", "w") as file:
+            json.dump(data, file)
 
     def load_tracked_files(self):
-        if os.path.isfile(".localchat-tracking"):
-            with open(".localchat-tracking", "r") as file:
-                for line in file.readlines():
-                    filepath, tokens = line.strip().split(",")
-                    self.tracked_files[filepath] = int(tokens)
-                    self.total_tokens += int(tokens)
-            print(f"Loaded tracked files: {', '.join(self.tracked_files.keys())}")
+        if os.path.isfile(".localchat-tracking.json"):
+            with open(".localchat-tracking.json", "r") as file:
+                data = json.load(file)
+                self.tracked_files = data.get("tracked_files", {})
+                self.lenses = data.get("lenses", {})  # Load lenses
+                self.active_lens = data.get("active_lens", "")  # Load the active lens
+                self.total_tokens = sum(self.tracked_files.values())
+            tracked_string = "\n".join(self.tracked_files.keys())
+            print(f"Loaded tracked files: \n====\n{tracked_string}\n====\n")
+            # Optionally, report loaded lenses
+            print(
+                f"Loaded lenses: {', '.join(self.lenses.keys()) if self.lenses else 'None'}"
+            )
+            print(f"Active lens: {self.active_lens if self.active_lens else 'None'}")
 
     def list_tracked_files(self) -> None:
         if self.tracked_files:
@@ -107,7 +121,10 @@ class SimpleChatbot:
 
     def read_tracked_files(self) -> str:
         content = "Tracked file context:\n\n"
-        for filepath in self.tracked_files.keys():
+        files_dict = (
+            self.lenses[self.active_lens] if self.active_lens else self.tracked_files
+        )
+        for filepath in files_dict.keys():
             with open(filepath, "r") as file:
                 content += f"File: {filepath}\n\n" + "```\n" + file.read() + "```\n\n"
         return content
@@ -162,6 +179,79 @@ class SimpleChatbot:
             self.save_tracked_files()
         print(f"Removed all tracked files in directory: {directory_path}")
 
+    def create_lens(self, lens_name: str) -> None:
+        if lens_name in self.lenses:
+            print(f"Lens '{lens_name}' already exists.")
+            return
+        self.lenses[lens_name] = {}
+        self.active_lens = lens_name  # Set the newly created lens as the active lens
+        if self.persist:
+            self.save_tracked_files()
+        print(f"Lens '{lens_name}' created.")
+
+    def list_lenses(self) -> None:
+        if not self.lenses:
+            print("No lenses available.")
+            return
+        print("Available Lenses:")
+        for lens_name in self.lenses.keys():
+            print(f"- {lens_name}")
+        print(f"Active Lens: {self.active_lens if self.active_lens else 'None'}")
+
+    def switch_lens(self, lens_name: str) -> None:
+        if lens_name == "none":  # Special keyword to switch back to no lens
+            self.active_lens = ""
+            if self.persist:
+                self.save_tracked_files()
+            print("Switched to no active lens.")
+            return
+        if lens_name not in self.lenses:
+            print(f"Lens '{lens_name}' does not exist.")
+            return
+        self.active_lens = lens_name
+        if self.persist:
+            self.save_tracked_files()
+        print(f"Switched to lens '{lens_name}'.")
+
+    def add_file_to_lens(self, filepath: str) -> None:
+        if not self.active_lens:
+            print("No active lens. Please switch to or create a lens first.")
+            return
+        if filepath in self.tracked_files:
+            self.lenses[self.active_lens][filepath] = self.tracked_files[filepath]
+            if self.persist:
+                self.save_tracked_files()
+            print(f"File {filepath} added to lens '{self.active_lens}'.")
+        else:
+            print(f"File {filepath} is not tracked. Please track the file first.")
+
+    # Remove file from the current lens
+    def remove_file_from_lens(self, filepath: str) -> None:
+        if not self.active_lens or filepath not in self.lenses[self.active_lens]:
+            print(f"File {filepath} is not part of the active lens.")
+            return
+        del self.lenses[self.active_lens][filepath]
+        if self.persist:
+            self.save_tracked_files()
+        print(f"File {filepath} removed from lens '{self.active_lens}'.")
+
+    def list_files_in_lens(self, lens_name: str) -> None:
+        if lens_name not in self.lenses:
+            print(f"Lens '{lens_name}' does not exist.")
+            return
+        if len(self.lenses[lens_name]) == 0:
+            print(f"No files in the lens '{lens_name}'.")
+            return
+        print(f"Files in lens '{lens_name}':")
+        for filepath in self.lenses[lens_name].keys():
+            print(f"- {filepath} (Tokens: {self.lenses[lens_name][filepath]})")
+
+    def list_files_in_current_lens(self) -> None:
+        if not self.active_lens:
+            print("There is no active lens.")
+            return
+        self.list_files_in_lens(self.active_lens)
+
     def get_stream_response(self, prompt: str) -> Generator[str, None, None]:
         response = self.client.chat.completions.create(
             messages=[{"role": "user", "content": self.read_tracked_files()}]
@@ -207,6 +297,25 @@ class SimpleChatbot:
             elif user_input.startswith("/remove_dir "):
                 directory = user_input[len("/remove_dir ") :]
                 self.remove_tracked_directory(directory)
+            elif user_input.startswith("/create_lens "):
+                lens_name = user_input[len("/create_lens ") :]
+                self.create_lens(lens_name)
+            elif user_input == "/list_lenses":
+                self.list_lenses()
+            elif user_input.startswith("/switch_lens "):
+                lens_name = user_input[len("/switch_lens ") :]
+                self.switch_lens(lens_name)
+            elif user_input.startswith("/add_to_lens "):
+                filename = user_input[len("/add_to_lens ") :]
+                self.add_file_to_lens(filename)
+            elif user_input.startswith("/remove_from_lens "):
+                filename = user_input[len("/remove_from_lens ") :]
+                self.remove_file_from_lens(filename)
+            elif user_input.startswith("/list_lens "):
+                lens_name = user_input[len("/list_files_in_lens ") :]
+                self.list_files_in_lens(lens_name)
+            elif user_input == "/list_lens":
+                self.list_files_in_current_lens()
             else:
                 self.messages.append({"role": "user", "content": user_input})
                 print(colored("Bot: ", "yellow"), end="", flush=True)
